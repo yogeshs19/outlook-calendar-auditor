@@ -5,7 +5,7 @@ import numpy as np
 from datetime import datetime, timedelta, time
 
 st.set_page_config(page_title="Team Free Slot Finder (Outlook CSV)", layout="wide")
-st.title("🗓️ Team Free Slot Finder — Outlook CSV")
+st.title("🗓️ Team Free Slot Finder — Outlook CSV (Patched)")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -70,7 +70,6 @@ def parse_start_end(df: pd.DataFrame):
     return start, end
 
 def clean_events(df, exclude_all_day=True, exclude_holidays=True, exclude_birthdays=True):
-    # Standardize column names we care about
     subj_col = next((c for c in df.columns if c.strip().lower()=="subject"), None)
     if exclude_all_day and "All Day Event" in df.columns:
         mask_all_day = df["All Day Event"].astype(str).str.lower().isin(["true","1","yes"])
@@ -82,6 +81,10 @@ def clean_events(df, exclude_all_day=True, exclude_holidays=True, exclude_birthd
             df = df[~df[subj_col].astype(str).str.contains("birthday", case=False, na=False)]
     start, end = parse_start_end(df)
     df = df.assign(StartDT=start, EndDT=end)
+    df = df[df["StartDT"].notna() & df["EndDT"].notna()].copy()
+    # Force to datetime64[ns] to avoid object/str comparisons later
+    df["StartDT"] = pd.to_datetime(df["StartDT"], errors="coerce")
+    df["EndDT"] = pd.to_datetime(df["EndDT"], errors="coerce")
     df = df[df["StartDT"].notna() & df["EndDT"].notna()].copy()
     df = df.sort_values("StartDT").reset_index(drop=True)
     return df
@@ -95,14 +98,22 @@ def build_busy_mask(events: pd.DataFrame, day_start: datetime, day_end: datetime
         t += step
     if not len(slots):
         return np.array([], dtype=bool), []
-    start_arr = events["StartDT"].values
-    end_arr = events["EndDT"].values
+
+    if events.empty:
+        return np.zeros(len(slots), dtype=bool), slots
+
+    # Ensure numpy datetime64 arrays
+    start_arr = pd.to_datetime(events["StartDT"], errors="coerce").to_numpy(dtype="datetime64[ns]")
+    end_arr = pd.to_datetime(events["EndDT"], errors="coerce").to_numpy(dtype="datetime64[ns]")
+
     busy = np.zeros(len(slots), dtype=bool)
     for i, s in enumerate(slots):
         e = s + step
-        # overlapping if event start < slot_end and event end > slot_start
-        overlap = ((start_arr < e) & (end_arr > s)).any()
-        busy[i] = bool(overlap)
+        s64 = np.datetime64(s)
+        e64 = np.datetime64(e)
+        # overlap if any event: start < slot_end && end > slot_start
+        mask = (start_arr < e64) & (end_arr > s64)
+        busy[i] = bool(mask.any())
     return busy, slots
 
 def find_common_free(calendars, work_start: time, work_end: time, slot_minutes: int, horizon_days: int):
@@ -113,30 +124,32 @@ def find_common_free(calendars, work_start: time, work_end: time, slot_minutes: 
         day = today + timedelta(days=d)
         day_start = datetime.combine(day, work_start)
         day_end = datetime.combine(day, work_end)
-        # skip weekends? (Optional) — comment out next two lines to include weekends
-        # if day.weekday() >= 5:
-        #     continue
-        # Build each person's busy mask
+
         masks = []
         slots_ref = None
         for ev in calendars:
             busy, slots = build_busy_mask(ev, day_start, day_end, step)
             if slots_ref is None:
                 slots_ref = slots
-            # Align lengths
-            if len(busy) != len(slots_ref):
-                # if mismatch (shouldn't happen), pad/trim
+            if len(busy) == 0:
+                # No slots for this day; treat as all-free during work hours
+                busy = np.zeros(len(slots_ref), dtype=bool) if slots_ref else np.array([], dtype=bool)
+            # Align lengths just in case
+            if slots_ref and len(busy) != len(slots_ref):
                 L = len(slots_ref)
                 b = np.zeros(L, dtype=bool)
                 b[:min(L, len(busy))] = busy[:min(L, len(busy))]
                 busy = b
             masks.append(busy)
+
         if not masks or slots_ref is None:
             continue
+
         combined_busy = np.zeros_like(masks[0])
         for m in masks:
             combined_busy |= m
         free_mask = ~combined_busy
+
         # group consecutive free slots
         i = 0
         while i < len(free_mask):
@@ -146,7 +159,12 @@ def find_common_free(calendars, work_start: time, work_end: time, slot_minutes: 
                     j += 1
                 start_ts = slots_ref[i]
                 end_ts = slots_ref[min(j, len(slots_ref)-1)] + step
-                suggestions.append({"Date": day.isoformat(), "Start": start_ts, "End": end_ts, "DurationMin": int((end_ts - start_ts).total_seconds()/60)})
+                suggestions.append({
+                    "Date": start_ts.date().isoformat(),
+                    "Start": start_ts,
+                    "End": end_ts,
+                    "DurationMin": int((end_ts - start_ts).total_seconds()/60)
+                })
                 i = j
             else:
                 i += 1
@@ -175,7 +193,6 @@ if suggestions.empty:
     st.warning("No common free slots found within the selected horizon and working hours.")
 else:
     st.success(f"Found {len(suggestions)} free blocks across the next {horizon_days} days.")
-    # Show top suggestions (longest first), then by soonest
     top = suggestions.sort_values(["DurationMin","Date","Start"], ascending=[False, True, True]).head(50)
     st.subheader("⭐ Top suggestions (longest first)")
     st.dataframe(top)
