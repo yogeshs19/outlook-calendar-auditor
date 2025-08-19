@@ -6,8 +6,8 @@ import re
 from io import StringIO
 from datetime import datetime, date, time, timedelta
 
-st.set_page_config(page_title="Outlook Scheduling Assistant (CSV/ICS)", layout="wide")
-st.title("📆 Scheduling Assistant (CSV/ICS) — Teams-like")
+st.set_page_config(page_title="Scheduling Assistant — CSV/ICS (Busy-aware)", layout="wide")
+st.title("📆 Scheduling Assistant — CSV/ICS (Busy-aware)")
 
 # ================= Sidebar Controls =================
 with st.sidebar:
@@ -21,7 +21,12 @@ with st.sidebar:
     exclude_holidays = st.checkbox("Exclude holidays", value=True)
     exclude_birthdays = st.checkbox("Exclude birthdays", value=True)
     st.markdown("---")
-    horizon_days = st.slider("Find common free slots for next N days", 1, 30, 7)
+    st.caption("Which 'Show As' count as BUSY?")
+    busy_count_free = st.checkbox("Treat 'Free' as busy", value=False)
+    busy_count_tentative = st.checkbox("Treat 'Tentative' as busy", value=True)
+    busy_count_working_elsewhere = st.checkbox("Treat 'Working Elsewhere' as busy", value=True)
+    busy_count_ooo = st.checkbox("Treat 'Out of Office' as busy", value=True)
+    horizon_days = st.slider("Find common free slots for next N days", 1, 45, 14)
 
 uploads = st.file_uploader(
     "Upload **one CSV or ICS per person** (Outlook export or calendar ICS). Rename participants below if needed.",
@@ -29,7 +34,7 @@ uploads = st.file_uploader(
     accept_multiple_files=True
 )
 
-st.caption("Tip: For Outlook CSV — File → Open & Export → Import/Export → **Export to a file → CSV** → Calendar. For Outlook on the web: export **ICS** and upload directly here.")
+st.caption("Outlook CSV: File → Open & Export → Import/Export → Export to a file → CSV → Calendar. Outlook on the web: export ICS.")
 
 # ================= Utilities =================
 
@@ -122,9 +127,14 @@ def ics_to_df(text):
             cur["Subject"] = value
         elif name == "LOCATION":
             cur["Location"] = value
+        elif name == "TRANSP":
+            # TRANSPARENT => free, OPAQUE => busy
+            cur["ShowAs"] = "Free" if value.strip().upper()=="TRANSPARENT" else "Busy"
     df = pd.DataFrame(events)
-    # drop invalid
     if not df.empty:
+        df = df[df["StartDT"].notna() & df["EndDT"].notna()].copy()
+        df["StartDT"] = pd.to_datetime(df["StartDT"], errors="coerce")
+        df["EndDT"] = pd.to_datetime(df["EndDT"], errors="coerce")
         df = df[df["StartDT"].notna() & df["EndDT"].notna()].copy()
     return df
 
@@ -141,9 +151,9 @@ def parse_start_end_csv(df: pd.DataFrame):
 
     # fallback to split
     if start.isna().all() and {"Start Date","Start Time"}.issubset(df.columns):
-        start = pd.to_datetime(df["Start Date"].astype(str) + " " + df["Start Time"].astype(str), errors="coerce")
+        start = pd.to_datetime(df["Start Date"].astype(str) + " " + df["Start Time"].astype(str), errors="coerce", dayfirst=False)
     if end.isna().all() and {"End Date","End Time"}.issubset(df.columns):
-        end = pd.to_datetime(df["End Date"].astype(str) + " " + df["End Time"].astype(str), errors="coerce")
+        end = pd.to_datetime(df["End Date"].astype(str) + " " + df["End Time"].astype(str), errors="coerce", dayfirst=False)
 
     # common variants
     if start.isna().all():
@@ -163,6 +173,14 @@ def parse_start_end_csv(df: pd.DataFrame):
         end = pd.Series(end, index=df.index)
     return start, end
 
+def csv_show_as_column(df):
+    # Try common Outlook export names
+    for c in df.columns:
+        cl = c.strip().lower()
+        if cl in ("show time as","show as","busystatus","busy status","showtimeas"):
+            return c
+    return None
+
 def clean_events_csv(df, exclude_all_day=True, exclude_holidays=True, exclude_birthdays=True):
     subj_col = next((c for c in df.columns if c.strip().lower()=="subject"), None)
     if exclude_all_day and "All Day Event" in df.columns:
@@ -179,7 +197,26 @@ def clean_events_csv(df, exclude_all_day=True, exclude_holidays=True, exclude_bi
     df["StartDT"] = pd.to_datetime(df["StartDT"], errors="coerce")
     df["EndDT"] = pd.to_datetime(df["EndDT"], errors="coerce")
     df = df[df["StartDT"].notna() & df["EndDT"].notna()].copy()
+    # Standardize 'ShowAs'
+    show_col = csv_show_as_column(df)
+    if show_col:
+        df["ShowAs"] = df[show_col].astype(str).str.title()
     return df.sort_values("StartDT").reset_index(drop=True)
+
+def is_event_busy(show_as: str) -> bool:
+    if not isinstance(show_as, str) or not show_as:
+        return True  # assume busy if unknown
+    val = show_as.strip().lower()
+    if val == "free":
+        return busy_count_free
+    if val in ("tentative", "maybe"):
+        return busy_count_tentative
+    if val in ("working elsewhere", "workingelsewhere"):
+        return busy_count_working_elsewhere
+    if val in ("out of office", "ooo"):
+        return busy_count_ooo
+    # "Busy" or anything else -> busy
+    return True
 
 def build_slots(day: date, start: time, end: time, step_min: int):
     slots = []
@@ -194,6 +231,11 @@ def build_slots(day: date, start: time, end: time, step_min: int):
 def person_busy_mask(events: pd.DataFrame, slots, step):
     if events.empty:
         return np.zeros(len(slots), dtype=bool)
+    # Precompute which events count as BUSY
+    if "ShowAs" in events.columns:
+        busy_flags = events["ShowAs"].apply(is_event_busy).to_numpy(dtype=bool)
+    else:
+        busy_flags = np.ones(len(events), dtype=bool)
     starts = events["StartDT"].to_numpy(dtype="datetime64[ns]")
     ends = events["EndDT"].to_numpy(dtype="datetime64[ns]")
     busy = np.zeros(len(slots), dtype=bool)
@@ -201,7 +243,7 @@ def person_busy_mask(events: pd.DataFrame, slots, step):
         e = s + step
         s64 = np.datetime64(s)
         e64 = np.datetime64(e)
-        mask = (starts < e64) & (ends > s64)
+        mask = (starts < e64) & (ends > s64) & busy_flags
         busy[i] = bool(mask.any())
     return busy
 
@@ -265,8 +307,8 @@ for i, up in enumerate(uploads):
     else:  # ICS
         txt = up.read().decode("utf-8", errors="replace")
         ev = ics_to_df(txt)
-        if exclude_all_day:
-            ev = ev[~ev.get("_ALLDAY", False)]
+        if exclude_all_day and "_ALLDAY" in ev.columns:
+            ev = ev[~ev["_ALLDAY"]]
         if exclude_holidays and "Subject" in ev.columns:
             ev = ev[~ev["Subject"].astype(str).str.contains("holiday", case=False, na=False)]
         if exclude_birthdays and "Subject" in ev.columns:
@@ -280,7 +322,7 @@ for i, up in enumerate(uploads):
 st.subheader("📊 Files parsed")
 st.dataframe(pd.DataFrame(summary_rows))
 
-# ======== Day Grid (Scheduling Assistant-like) ========
+# ======== Day Grid ========
 st.subheader(f"🗓️ Availability grid — {show_date.isoformat()}")
 slots, step = build_slots(show_date, work_start, work_end, slot_minutes)
 if not slots:
@@ -297,12 +339,28 @@ else:
     grid_df = pd.DataFrame(grid)
     st.dataframe(grid_df)
 
+# ======== Per-day diagnostics (selected date) ========
+st.subheader("🔎 Events on selected day (per person)")
+for person in calendars:
+    ev = person["events"]
+    day_start = datetime.combine(show_date, time.min)
+    day_end = datetime.combine(show_date, time.max)
+    day_ev = ev[(ev["StartDT"] <= day_end) & (ev["EndDT"] >= day_start)].copy()
+    if not day_ev.empty:
+        day_ev["Start"] = day_ev["StartDT"].dt.strftime("%Y-%m-%d %H:%M")
+        day_ev["End"] = day_ev["EndDT"].dt.strftime("%Y-%m-%d %H:%M")
+        cols = [c for c in ["Start","End","Subject","ShowAs","Location"] if c in day_ev.columns]
+        with st.expander(f"📄 {person['name']} — {len(day_ev)} event(s) on {show_date.isoformat()}"):
+            st.dataframe(day_ev[cols])
+    else:
+        st.info(f"{person['name']}: no events on {show_date.isoformat()}")
+
 # ======== Common Free Suggestions ========
 st.subheader(f"✅ Common free slots — next {horizon_days} days")
 events_only = [p["events"] for p in calendars]
 sug = common_free(events_only, work_start, work_end, slot_minutes, horizon_days)
 if sug.empty:
-    st.warning("No common free slots found. Try extending horizon, widening working hours, or turning off exclusions.")
+    st.warning("No common free slots found. Try widening work hours or horizon, or toggling which 'Show As' count as busy.")
 else:
     st.dataframe(sug.head(200))
     st.download_button("Download suggestions (CSV)", sug.to_csv(index=False).encode("utf-8"), "common_free_slots.csv", "text/csv")
