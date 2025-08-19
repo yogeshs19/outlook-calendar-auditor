@@ -1,19 +1,18 @@
-# 🎈 Blank app template
+# Outlook Calendar Auditor
 
-A simple Streamlit app template for you to modify!
+A Streamlit app to audit Outlook calendar events for issues like:
+- After-hours meetings
+- Missing location
+- Overlaps (to be extended)
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Run locally
 
-### How to run it on your own machine
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
 
-1. Install the requirements
-
-   ```
-   $ pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+## Deploy to Streamlit Cloud
+1. Push this repo to GitHub.
+2. Go to https://share.streamlit.io and link your repo.
+3. Deploy with `streamlit_app.py` as the entry point.
